@@ -1,0 +1,13 @@
+[package]
+name = "rustos-libc"
+version = "0.1.0"
+edition = "2021"
+description = "no_std userspace runtime (libc) for RustOS: raw syscall layer with a mockable backend, typed wrappers, a heap allocator over a caller-provided region, printf-style formatting, file I/O, and program startup."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustos_libc"
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
