@@ -20,8 +20,12 @@
 //! ## What this crate provides
 //!
 //! * [`init_runtime`] — install the heap region into the global
-//!   [`crate::ALLOCATOR`] (backing `Vec`/`String`/`Box` once the
-//!   program sets `#[global_allocator]`).
+//!   [`crate::ALLOCATOR`] (backing `Vec`/`String`/`Box` — on a
+//!   freestanding target with the `global-allocator` feature
+//!   [`crate::ALLOCATOR`] *is* the program's global allocator, so
+//!   there is exactly one heap instance; a program must NOT
+//!   declare a second `#[global_allocator]` static, see
+//!   [`crate::ALLOCATOR`]).
 //! * [`start`] — initialise the heap, run `main`, and `exit` with
 //!   its return code. This is the whole runtime: there is no
 //!   argument parsing, no environment, no TLS, no atexit.
@@ -41,7 +45,7 @@
 
 use crate::heap::{init_heap, ALLOCATOR};
 use crate::io::Syscalls;
-use crate::syscall::RealBackend;
+use crate::syscall::default_backend;
 
 /// The region the kernel hands a userspace program at startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,9 +83,20 @@ pub unsafe fn init_runtime(info: StartInfo) -> bool {
 /// with its return code. Never returns.
 ///
 /// `main` runs with the global heap installed, so it may use
-/// `alloc::vec::Vec`/`String`/`Box` provided the program declared
-/// `#[global_allocator] static ALLOC: RustosAlloc =
-/// RustosAlloc::new();`.
+/// `alloc::vec::Vec`/`String`/`Box`: on a freestanding target with
+/// the `global-allocator` feature the global allocator is
+/// [`crate::ALLOCATOR`] itself (see its docs), which is the
+/// instance this installs the heap into — there is exactly one
+/// allocator, so `format!` in `main` allocates through the
+/// installed heap.
+///
+/// The exit goes through [`default_backend()`] — [`RealBackend`]
+/// since Batch 11 (the kernel wires the MSR entry), [`Int80Backend`]
+/// with the `int80-backend` feature. Before Batch 11 the exit had
+/// to go through `Int80Backend`: `RealBackend` issues the `syscall`
+/// instruction, which needs the MSR entry the kernel did not wire
+/// up — a program exiting through it would `#UD` instead of
+/// exiting.
 ///
 /// # Safety
 ///
@@ -93,7 +108,7 @@ pub fn start(info: StartInfo, main: fn() -> i32) -> ! {
         init_runtime(info);
     }
     let code = main();
-    let mut backend = RealBackend;
+    let mut backend = default_backend();
     let mut sys = Syscalls::new(&mut backend);
     sys.exit(code)
 }

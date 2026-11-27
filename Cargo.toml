@@ -9,5 +9,22 @@ license = "MIT OR Apache-2.0"
 name = "rustos_libc"
 path = "src/lib.rs"
 
+[features]
+# The global allocator (see `ALLOCATOR` in src/heap.rs): userspace
+# programs (rustos-hello, rustos-sh) enable this so libc's
+# ALLOCATOR is their `#[global_allocator]` on freestanding
+# targets. It is NOT default: the kernel also links this crate
+# and has its own global allocator (a `LockedHeap` in
+# rustos-kernel/src/memory.rs), and two `#[global_allocator]`
+# statics in one binary is a link error — so the kernel's build
+# must never see this feature.
+global-allocator = []
+# Use the `int 0x80` trap as the default syscall backend instead
+# of the `syscall` instruction (Batch 11 fallback): the kernel
+# serves both paths through the same dispatcher, but the fast
+# path needs the MSR entry (wired in Batch 11). Off by default —
+# real programs use [`RealBackend`].
+int80-backend = []
+
 [profile.dev]
 panic = "abort"

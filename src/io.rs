@@ -11,6 +11,8 @@
 //! * `close(fd)` — a0 = fd; returns 0.
 //! * `yield()` — no arguments; returns 0.
 //! * `getpid()` — no arguments; returns the pid.
+//! * `uptime()` — no arguments; returns milliseconds since boot
+//!   (RustOS-private syscall 1000).
 //! * `spawn(path, argv_ptr, argc)` — a0 = pointer to a NUL-terminated
 //!   path, a1 = pointer to a NULL-terminated array of pointers to
 //!   NUL-terminated argument strings, a2 = argc; returns the new pid.
@@ -28,7 +30,7 @@
 
 use crate::syscall::{
     check, Error, Result, SyscallBackend, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETPID,
-    SYS_OPEN, SYS_READ, SYS_SPAWN, SYS_WAIT, SYS_WRITE, SYS_YIELD,
+    SYS_OPEN, SYS_READ, SYS_SPAWN, SYS_UPTIME, SYS_WAIT, SYS_WRITE, SYS_YIELD,
 };
 
 /// `open` flags (Linux-compatible values).
@@ -58,8 +60,12 @@ pub struct Syscalls<'a> {
 }
 
 impl<'a> Syscalls<'a> {
-    /// Wrap a backend. Real programs pass [`crate::RealBackend`];
-    /// tests pass [`crate::MockBackend`].
+    /// Wrap a backend. Real programs pass [`crate::default_backend()`]
+    /// ([`crate::RealBackend`], the `syscall` instruction, since
+    /// Batch 11 wired the kernel's MSR entry); tests pass
+    /// [`crate::MockBackend`]. [`crate::Int80Backend`] (the
+    /// `int 0x80` trap) is the fallback, selected by the
+    /// `int80-backend` feature.
     pub fn new(backend: &'a mut dyn SyscallBackend) -> Self {
         Self { backend }
     }
@@ -124,6 +130,14 @@ impl<'a> Syscalls<'a> {
     /// `getpid()`: pid of the calling process.
     pub fn getpid(&mut self) -> Result<u32> {
         Ok(check(self.raw(SYS_GETPID, 0, 0, 0))? as u32)
+    }
+
+    /// `uptime()`: milliseconds since boot (PIT ticks * 10 at
+    /// 100 Hz). RustOS-private syscall 1000 (see
+    /// `crate::syscall::SYS_UPTIME`); added in Batch 9 for the
+    /// userspace shell's `uptime` builtin.
+    pub fn uptime(&mut self) -> Result<u64> {
+        Ok(check(self.raw(SYS_UPTIME, 0, 0, 0))? as u64)
     }
 
     /// `spawn(path, argv)`: start a new process running `path` with
@@ -203,8 +217,8 @@ fn nul_terminate(s: &str) -> Result<[u8; MAX_PATH_LEN + 1]> {
 mod tests {
     use super::*;
     use crate::syscall::{
-        MockBackend, SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_OPEN, SYS_READ, SYS_SPAWN, SYS_WAIT,
-        SYS_WRITE, SYS_YIELD,
+        MockBackend, SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_OPEN, SYS_READ, SYS_SPAWN, SYS_UPTIME,
+        SYS_WAIT, SYS_WRITE, SYS_YIELD,
     };
 
     /// Run `f` against a fresh `Syscalls` over a mock with the given
@@ -281,6 +295,15 @@ mod tests {
         assert_eq!(numbers, vec![SYS_OPEN, SYS_CLOSE, SYS_YIELD, SYS_GETPID]);
         assert_eq!(mock.calls[0].a1, O_RDONLY as u64);
         assert_eq!(mock.calls[1].a0, 3);
+    }
+
+    #[test]
+    fn uptime_returns_milliseconds_from_syscall_1000() {
+        let (mock, r) = with_mock(&[12340], |sys| sys.uptime());
+        assert_eq!(r, Ok(12340));
+        let call = mock.last_call().unwrap();
+        assert_eq!(call.number, SYS_UPTIME);
+        assert_eq!((call.a0, call.a1, call.a2), (0, 0, 0));
     }
 
     #[test]

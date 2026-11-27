@@ -14,6 +14,7 @@
 //! | 57     | spawn  | `spawn(path, argv_ptr, argc)` |
 //! | 60     | exit   | `exit(code)` — never returns |
 //! | 61     | wait   | `wait(pid)` |
+//! | 1000   | uptime | `uptime()` -> ms since boot (RustOS-private) |
 //!
 //! The kernel returns a negative errno (`-9`, `-22`, `-38`, …) on
 //! error; [`Error::from_raw`] turns that into a typed error and the
@@ -48,6 +49,12 @@ pub const SYS_EXIT: u64 = 60;
 /// wait(pid) -> exit code, or negative errno; blocks if not exited.
 pub const SYS_WAIT: u64 = 61;
 
+/// uptime() -> milliseconds since boot. RustOS-private number 1000
+/// (see `rustos-process/src/syscall.rs`): the low numbers are
+/// Linux's and Linux has no uptime syscall. Added in Batch 9 for
+/// the userspace shell's `uptime` builtin.
+pub const SYS_UPTIME: u64 = 1000;
+
 /// Standard file descriptors.
 pub const FD_STDIN: u64 = 0;
 /// Standard file descriptors.
@@ -67,6 +74,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         SYS_SPAWN => "spawn",
         SYS_EXIT => "exit",
         SYS_WAIT => "wait",
+        SYS_UPTIME => "uptime",
         _ => "unknown",
     }
 }
@@ -82,6 +90,7 @@ pub const ALL_SYSCALLS: &[(u64, &str)] = &[
     (SYS_SPAWN, "spawn"),
     (SYS_EXIT, "exit"),
     (SYS_WAIT, "wait"),
+    (SYS_UPTIME, "uptime"),
 ];
 
 /// A kernel error, as a positive errno number (Linux-compatible).
@@ -186,6 +195,12 @@ pub trait SyscallBackend {
 /// instruction clobbers `rcx` and `r11`, result in `rax`.
 /// On non-x86_64 targets there is no trap yet and every call
 /// returns `ERR_NOSYS` (`-38`).
+///
+/// This is the default backend for real RustOS programs (see
+/// [`default_backend()`]): the kernel wires the MSR entry
+/// (`EFER.SCE`/`LSTAR`/`STAR`/`SFMASK` + `swapgs`) since Batch
+/// 11, so the instruction lands in the kernel's fast stub instead
+/// of `#UD`ing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealBackend;
 
@@ -216,6 +231,82 @@ impl SyscallBackend for RealBackend {
     fn syscall(&mut self, number: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         raw_syscall(number, a0, a1, a2)
     }
+}
+
+/// The `int 0x80` backend: the trap the RustOS kernel has served
+/// since Batch 6 (vector 0x80, DPL 3 interrupt gate).
+///
+/// Same registers as [`RealBackend`] (`rax` = number, `rdi`/`rsi`/
+/// `rdx` = a0/a1/a2, result in `rax`) — but unlike the `syscall`
+/// instruction it clobbers no registers (the kernel stub saves
+/// and restores all GPRs), so there are no `rcx`/`r11` clobbers
+/// to declare. `int 0x80` needs no MSR entry: the CPU switches
+/// to the kernel stack from `TSS.rsp[0]` on the trap, and the
+/// gate is already DPL 3.
+///
+/// This is the fallback backend, not the default: enable the
+/// `int80-backend` feature and [`default_backend()`] returns this
+/// instead of [`RealBackend`]. The kernel serves both paths
+/// through the same dispatcher, so a program linked either way
+/// behaves identically — the fast path is just faster.
+///
+/// This is also the backend [`crate::start`] used to use to exit
+/// (Batch 8–10): a program started through `start` had to be
+/// able to exit through the kernel that actually existed, and
+/// the MSR entry did not exist yet.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Int80Backend;
+
+#[cfg(target_arch = "x86_64")]
+fn raw_int80(number: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") number as i64 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            options(nostack, preserves_flags),
+        );
+    }
+    ret
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn raw_int80(_number: u64, _a0: u64, _a1: u64, _a2: u64) -> i64 {
+    Error::NOSYS.as_negative()
+}
+
+impl SyscallBackend for Int80Backend {
+    fn syscall(&mut self, number: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+        raw_int80(number, a0, a1, a2)
+    }
+}
+
+/// The default backend for a real RustOS program: [`RealBackend`]
+/// (the `syscall` instruction) since Batch 11, when the kernel
+/// wired the MSR entry. Enable the `int80-backend` feature and
+/// this returns [`Int80Backend`] instead — the kernel serves both
+/// paths through the same dispatcher, so the choice is purely
+/// which trap instruction the program issues. Programs should
+/// call this, not construct either backend directly, so the
+/// choice stays in one place.
+#[cfg(feature = "int80-backend")]
+pub fn default_backend() -> Int80Backend {
+    Int80Backend
+}
+/// The default backend for a real RustOS program: [`RealBackend`]
+/// (the `syscall` instruction) since Batch 11, when the kernel
+/// wired the MSR entry. Enable the `int80-backend` feature and
+/// this returns [`Int80Backend`] instead — the kernel serves both
+/// paths through the same dispatcher, so the choice is purely
+/// which trap instruction the program issues. Programs should
+/// call this, not construct either backend directly, so the
+/// choice stays in one place.
+#[cfg(not(feature = "int80-backend"))]
+pub fn default_backend() -> RealBackend {
+    RealBackend
 }
 
 /// One recorded raw syscall: number + three arguments.
@@ -252,6 +343,14 @@ pub struct MockBackend {
     /// Return value used when the scripted queue is empty.
     pub default_return: i64,
     returns: VecDeque<i64>,
+    /// Bytes waiting on stdin, for `SYS_READ`. When non-empty a
+    /// read delivers from here (up to `len`) and returns the count
+    /// delivered, ignoring the scripted return for that call (the
+    /// scripted value stays queued for the next non-read call).
+    /// When empty a read behaves exactly as before: the scripted
+    /// return (or `default_return`) comes back and nothing is
+    /// written into the caller's buffer.
+    pub stdin: VecDeque<u8>,
 }
 
 impl MockBackend {
@@ -263,7 +362,13 @@ impl MockBackend {
             spawns: Vec::new(),
             default_return: 0,
             returns: VecDeque::new(),
+            stdin: VecDeque::new(),
         }
+    }
+
+    /// Queue bytes for the next `SYS_READ` calls to deliver.
+    pub fn push_input(&mut self, bytes: &[u8]) {
+        self.stdin.extend(bytes.iter().copied());
     }
 
     /// Queue one return value for the next call.
@@ -298,6 +403,7 @@ impl MockBackend {
         self.output.clear();
         self.open_paths.clear();
         self.spawns.clear();
+        self.stdin.clear();
     }
 }
 
@@ -332,6 +438,21 @@ impl SyscallBackend for MockBackend {
             a1,
             a2,
         });
+        // Queued stdin takes precedence for a read: deliver the
+        // bytes into the caller's buffer and report how many went
+        // out. The scripted return is NOT consumed in that case —
+        // it stays queued for the next call. An empty stdin queue
+        // leaves the old behaviour untouched (scripted return,
+        // nothing written into the buffer).
+        if number == SYS_READ && a0 == FD_STDIN && !self.stdin.is_empty() {
+            let n = (a2 as usize).min(self.stdin.len());
+            let buf = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, n) };
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = self.stdin[i];
+            }
+            self.stdin.drain(..n);
+            return n as i64;
+        }
         let ret = self.returns.pop_front().unwrap_or(self.default_return);
         // Capture stdout/stderr writes so tests can read what the
         // program printed. `a1`/`a2` are a live pointer/length into
@@ -375,7 +496,8 @@ mod tests {
         assert_eq!(SYS_SPAWN, 57);
         assert_eq!(SYS_EXIT, 60);
         assert_eq!(SYS_WAIT, 61);
-        assert_eq!(ALL_SYSCALLS.len(), 9);
+        assert_eq!(SYS_UPTIME, 1000);
+        assert_eq!(ALL_SYSCALLS.len(), 10);
         let mut prev = 0u64;
         for (i, (n, name)) in ALL_SYSCALLS.iter().enumerate() {
             assert_eq!(syscall_name(*n), *name);
@@ -446,5 +568,48 @@ mod tests {
             && m.output.is_empty()
             && m.open_paths.is_empty()
             && m.spawns.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(feature = "int80-backend"))]
+    fn default_backend_is_real_backend() {
+        // Batch 11: the default is the `syscall` instruction now
+        // that the kernel wires the MSR entry. Compile-time pin:
+        // `default_backend()` must return a RealBackend — a
+        // function taking RealBackend accepts its result. (With
+        // the `int80-backend` feature the function returns
+        // Int80Backend and this test does not apply.)
+        fn takes_real(_: RealBackend) {}
+        takes_real(default_backend());
+    }
+
+    #[test]
+    fn mock_read_delivers_queued_stdin_then_falls_back() {
+        // Queued stdin delivers bytes into the caller's buffer and
+        // reports the delivered count, without consuming a scripted
+        // return; once the queue is empty the old behaviour (scripted
+        // return, nothing written) is back.
+        let mut m = MockBackend::new();
+        m.push_returns(&[-11]); // -EAGAIN, for the empty-queue read
+        m.push_input(b"hi");
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            m.syscall(SYS_READ, FD_STDIN, buf.as_mut_ptr() as u64, 1),
+            1
+        );
+        assert_eq!(buf[0], b'h');
+        assert_eq!(
+            m.syscall(SYS_READ, FD_STDIN, buf.as_mut_ptr() as u64, 8),
+            1
+        );
+        assert_eq!(buf[0], b'i');
+        // Queue empty now: the scripted -EAGAIN comes back, and the
+        // buffer is untouched.
+        buf[0] = 0;
+        assert_eq!(
+            m.syscall(SYS_READ, FD_STDIN, buf.as_mut_ptr() as u64, 8),
+            -11
+        );
+        assert_eq!(buf[0], 0);
     }
 }

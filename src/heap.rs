@@ -326,12 +326,13 @@ impl Heap {
 /// A [`GlobalAlloc`] over one heap, behind a spinlock.
 ///
 /// Create one as a `static` and initialise it once with
-/// [`init_heap`] (or [`RustosAlloc::init`]) before any allocation:
-///
-/// ```ignore
-/// #[global_allocator]
-/// static ALLOC: RustosAlloc = RustosAlloc::new();
-/// ```
+/// [`init_heap`] (or [`RustosAlloc::init`]) before any allocation.
+/// The process-wide instance is [`ALLOCATOR`]: on a freestanding
+/// target with the `global-allocator` feature it is also the
+/// program's global allocator (see its docs), so a program uses it
+/// by calling [`init_heap`] — it must NOT declare a second
+/// `#[global_allocator]` static of its own (see [`ALLOCATOR`]: an
+/// uninitialised second instance fails every allocation).
 pub struct RustosAlloc {
     heap: core::cell::UnsafeCell<Option<Heap>>,
     locked: AtomicBool,
@@ -429,6 +430,27 @@ unsafe impl GlobalAlloc for RustosAlloc {
 
 /// The process-wide allocator. Initialise it once with
 /// [`init_heap`] (see [`crate::start`]) before allocating.
+///
+/// This is the ONE allocator instance in a userspace program —
+/// and, on a freestanding target (`target_os = "none"`) with the
+/// `global-allocator` feature enabled, it is also the program's
+/// global allocator (see the attribute below), so
+/// `alloc::format!`/`Vec`/`String` allocate through the heap
+/// `start()` installs. A program must NOT declare its own
+/// `#[global_allocator] static ALLOC`: that would be a second,
+/// never-initialised `RustosAlloc`, and the first allocation
+/// through it would fail and panic — which is exactly how the
+/// Batch 9 live boot died (both programs exited 1 before printing
+/// anything; `start()` had initialised this `ALLOCATOR` while
+/// `format!` allocated through the programs' own dead `ALLOC`).
+/// The attribute is target- AND feature-gated, not `cfg(test)`:
+/// host test binaries (target `linux`) keep the standard
+/// allocator, so unit tests are unaffected; and the kernel — which
+/// links this crate but has its own global allocator — never
+/// enables the feature, so the two never collide in one binary.
+/// Userspace programs enable it in their `Cargo.toml`
+/// (`rustos-libc = { features = ["global-allocator"] }`).
+#[cfg_attr(all(target_os = "none", feature = "global-allocator"), global_allocator)]
 pub static ALLOCATOR: RustosAlloc = RustosAlloc::new();
 
 /// Initialise the process-wide heap over `[base, base + size)`.
@@ -604,8 +626,14 @@ mod tests {
         // Vec<String> through the global allocator.
         let mut v: Vec<alloc::string::String> = Vec::new();
         // NOTE: this Vec uses the *test binary's* global allocator,
-        // not ALLOCATOR — it only proves the types exist. Real
-        // userspace programs set #[global_allocator] themselves.
+        // not ALLOCATOR — it only proves the types exist. On a
+        // freestanding target with the `global-allocator` feature
+        // ALLOCATOR *is* the global allocator (see its docs), so
+        // this is the one place the two differ: host tests allocate
+        // through std's allocator, live programs through ALLOCATOR.
+        // The orchestrator's allocator-wiring check (rustos-build)
+        // pins that the shipped program binaries contain exactly
+        // one `RustosAlloc` static.
         v.push(alloc::string::String::from("hello"));
         assert_eq!(v[0], "hello");
         // Deliberately leak the allocation: ALLOCATOR still points

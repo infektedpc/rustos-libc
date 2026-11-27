@@ -3,9 +3,13 @@
 //! * `syscall` — raw syscall layer: the nine numbers (verified
 //!   against `rustos-process/src/syscall.rs`), the errno [`Error`]
 //!   type, the [`SyscallBackend`] trait, [`RealBackend`] (the
-//!   x86_64 `syscall` instruction) and [`MockBackend`] (records
-//!   calls, answers from a scripted queue, captures stdout/stderr
-//!   writes, open paths and spawn arguments for tests).
+//!   x86_64 `syscall` instruction — the default backend since
+//!   Batch 11 wired the kernel's MSR entry), [`Int80Backend`]
+//!   (the `int 0x80` trap — the fallback, selected by the
+//!   `int80-backend` feature) and [`MockBackend`] (records calls,
+//!   answers from a scripted queue, captures stdout/stderr writes,
+//!   open paths and spawn arguments for tests). [`default_backend()`]
+//!   is the constructor real programs call.
 //! * `io` — [`Syscalls`]: typed wrappers (`read`/`write`/`open`/
 //!   `close`/`yield_now`/`getpid`/`spawn`/`wait`/`exit`) that
 //!   translate negative returns into [`Error`] — callers never see
@@ -30,13 +34,16 @@
 //! [`MockBackend`] — no real syscall is ever executed on the host
 //! by the test suite.
 //!
-//! A program using this crate is `#![no_std]` + `#![no_main]`,
-//! provides its own `_start` and panic handler, and declares
-//!
-//! ```ignore
-//! #[global_allocator]
-//! static ALLOC: RustosAlloc = RustosAlloc::new();
-//! ```
+//! A program using this crate is `#![no_std]` + `#![no_main]` and
+//! provides its own `_start` and panic handler. It does NOT declare
+//! a global allocator of its own: this crate provides it —
+//! [`ALLOCATOR`] is the global allocator on a freestanding target
+//! when the program enables the `global-allocator` feature (see
+//! its docs) — and [`start`] installs the kernel-handed heap
+//! region into it. Declaring a second `#[global_allocator]` static
+//! in the program would leave `format!`/`Vec`/`String` allocating
+//! through a never-initialised heap, which fails every allocation
+//! (Batch 9: both live programs exited 1 before printing).
 //!
 //! See `examples/hello.rs` and the README for the full shape.
 
@@ -57,9 +64,9 @@ pub use fmt::{format_printf, printf_to, IntoPrintfArg, PrintfArg};
 pub use io::{Syscalls, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 pub use start::{heap_free_bytes, heap_ready, init_runtime, start, StartInfo};
 pub use syscall::{
-    check, Error, MockBackend, RealBackend, Result, SyscallBackend, SyscallCall,
-    ALL_SYSCALLS, FD_STDERR, FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_OPEN,
-    SYS_READ, SYS_SPAWN, SYS_WAIT, SYS_WRITE, SYS_YIELD,
+    check, Error, Int80Backend, MockBackend, RealBackend, Result, SyscallBackend, default_backend,
+    SyscallCall, ALL_SYSCALLS, FD_STDERR, FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETPID,
+    SYS_OPEN, SYS_READ, SYS_SPAWN, SYS_UPTIME, SYS_WAIT, SYS_WRITE, SYS_YIELD,
 };
 
 /// Convenience re-exports so userspace programs need only this
@@ -69,42 +76,40 @@ pub use alloc::format;
 
 /// Print to stdout through `sys`, using `core::fmt` formatting.
 /// `sys` is `&mut Syscalls` (e.g. `uprint!(&mut sys, "pid={}", pid)`).
+///
+/// The whole formatted line goes out in ONE `write` syscall. The
+/// old version formatted through `FileWriter`, which issues one
+/// syscall per `core::fmt` fragment (literal, argument, literal,
+/// …), so a timer tick between two fragments let another task's
+/// output land mid-line — the Batch 8 live boot showed `hello from
+/// userspace (pid 2)` and the kernel's `userspace: hello task pid 2
+/// created` on the same line for exactly this reason. Formatting
+/// first (heap `String`, installed by `start()` before `main`) and
+/// writing once makes a line atomic: the kernel's `write_console`
+/// holds the console lock for the whole buffer.
 #[macro_export]
 macro_rules! uprint {
     ($sys:expr, $($arg:tt)*) => {
         {
-            use core::fmt::Write as _;
-            let _ = write!(
-                $crate::FileWriter::new($crate::FD_STDOUT, $sys.backend()),
-                $($arg)*
-            );
+            let _ = $sys.write_str($crate::FD_STDOUT, &$crate::format!($($arg)*));
         }
     };
 }
 
-/// Like [`uprint!`], plus a trailing newline.
+/// Like [`uprint!`], plus a trailing newline — still a single
+/// `write` syscall (see [`uprint!`]).
 #[macro_export]
 macro_rules! uprintln {
     ($sys:expr, $($arg:tt)*) => {
         {
-            use core::fmt::Write as _;
-            let _ = write!(
-                $crate::FileWriter::new($crate::FD_STDOUT, $sys.backend()),
-                $($arg)*
-            );
-            let _ = write!(
-                $crate::FileWriter::new($crate::FD_STDOUT, $sys.backend()),
-                "\n"
-            );
+            let mut s = $crate::format!($($arg)*);
+            s.push('\n');
+            let _ = $sys.write_str($crate::FD_STDOUT, &s);
         }
     };
     ($sys:expr) => {
         {
-            use core::fmt::Write as _;
-            let _ = write!(
-                $crate::FileWriter::new($crate::FD_STDOUT, $sys.backend()),
-                "\n"
-            );
+            let _ = $sys.write_str($crate::FD_STDOUT, "\n");
         }
     };
 }
@@ -124,6 +129,11 @@ mod tests {
         uprintln!(&mut sys);
         drop(sys);
         assert_eq!(mock.output, b"pid=42done\n\n");
+        // One `write` syscall per macro call, not one per `core::fmt`
+        // fragment: the Batch 8 live boot interleaved another task's
+        // line inside a multi-write `uprintln!`. A line that goes
+        // out in one write cannot be split by a timer tick.
+        assert_eq!(mock.calls_for(SYS_WRITE).len(), 3);
     }
 
     #[test]
